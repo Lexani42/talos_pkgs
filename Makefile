@@ -1,6 +1,6 @@
 # THIS FILE WAS AUTOMATICALLY GENERATED, PLEASE DO NOT EDIT.
 #
-# Generated on 2025-11-12T13:04:22Z by kres 911d166.
+# Generated on 2025-11-18T15:04:13Z by kres e1d6dac.
 
 # common variables
 
@@ -100,6 +100,7 @@ TARGETS += xz
 TARGETS += zlib
 TARGETS += zstd
 TARGETS += kernel
+TARGETS += beegfs-client-pkg
 TARGETS += drbd-pkg
 TARGETS += ena-pkg
 TARGETS += gasket-driver-pkg

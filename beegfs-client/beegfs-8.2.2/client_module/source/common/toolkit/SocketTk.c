@@ -1,0 +1,222 @@
+#include <common/toolkit/SocketTk.h>
+#include <common/net/sock/StandardSocket.h>
+#include <common/net/sock/RDMASocket.h>
+#include <common/Common.h>
+#include <common/toolkit/TimeTk.h>
+
+#include <linux/in.h>
+#include <linux/inet.h>
+#include <linux/poll.h>
+#include <linux/net.h>
+#include <linux/socket.h>
+
+
+struct file* SocketTkDummyFilp = NULL;
+
+
+/**
+ * One-time initialization of a dummy file pointer (required for polling)
+ * Note: remember to call the corresponding uninit routine
+ */
+bool SocketTk_initOnce(void)
+{
+   SocketTkDummyFilp = filp_open("/dev/null", O_RDONLY, 0);
+   if(IS_ERR(SocketTkDummyFilp) )
+   {
+      printk_fhgfs(KERN_WARNING, "Failed to open the dummy filp for polling\n");
+      return false;
+   }
+
+   return true;
+}
+
+void SocketTk_uninitOnce(void)
+{
+   if(SocketTkDummyFilp && !IS_ERR(SocketTkDummyFilp) )
+      filp_close(SocketTkDummyFilp, NULL);
+}
+
+
+/*
+ * Synchronous I/O multiplexing for standard and RDMA sockets.
+ * Note: comparable to userspace poll()
+ *
+ * @param pollState list of sockets and event wishes
+ * @return number of socks for which interesting events are available or negative linux error code.
+ *  (tvp is being set to time remaining)
+ */
+int SocketTk_poll(PollState* state, int timeoutMS)
+{
+   struct poll_wqueues stdTable;
+   poll_table* stdWait = NULL; // value NULL means "don't register for waiting"
+   int table_err = 0;
+   int numSocksWithREvents = 0; // the return value
+   Socket* socket;
+
+   long __timeout = TimeTk_msToJiffiesSchedulable(timeoutMS);
+
+   /* 4.19 (vanilla, not stable) had a bug in the sock_poll_wait signature. rhel 4.18 backports
+    * this bug. 4.19.1 fixes it again. */
+   BUILD_BUG_ON(__builtin_types_compatible_p(
+            __typeof__(&sock_poll_wait),
+            void (*)(struct file*, poll_table*)));
+
+   poll_initwait(&stdTable);
+
+   if(__timeout)
+      stdWait = &stdTable.pt;
+
+   // 1st loop: register the socks that we're waiting for and wait blocking
+   // if no data is available yet
+   // 2nd loop (after event or timeout): check all socks for available data
+   //    note: std socks return all events, even those we haven't been waiting for
+   // 3rd and futher loops: in case an uninteresting event occurred
+   for( ; ; )
+   {
+      numSocksWithREvents = 0; // (must be inside the loop to be consistent)
+
+      /* wait INTERRUPTIBLE if no signal is pending, otherwise the wait contributes to load.
+       * users of this function should be migrated to use socket callbacks instead. */
+      set_current_state(signal_pending(current) ? TASK_KILLABLE : TASK_INTERRUPTIBLE);
+
+      // for each sock: ask for available data and register waitqueue
+      list_for_each_entry(socket, &state->list, poll._list)
+      {
+         if(socket->sockType == NICADDRTYPE_RDMA)
+         { // RDMA socket
+            RDMASocket* currentRDMASock = (RDMASocket*)socket;
+            bool finishPoll = (numSocksWithREvents || !__timeout);
+
+            unsigned long mask = RDMASocket_poll(
+               currentRDMASock, socket->poll._events, finishPoll);
+
+            if(mask)
+            { // interesting event occurred
+               socket->poll.revents = mask; // save event mask as revents
+               numSocksWithREvents++;
+            }
+         }
+         else
+         { // Standard socket
+            StandardSocket *standardSocket = (StandardSocket *) socket;
+            struct socket* currentRawSock = standardSocket->sock;
+            poll_table* currentStdWait = numSocksWithREvents ? NULL : stdWait;
+
+            unsigned long mask = (*currentRawSock->ops->poll)(
+               SocketTkDummyFilp, currentRawSock, currentStdWait);
+
+            if(mask & (socket->poll._events | POLLERR | POLLHUP | POLLNVAL) )
+            { // interesting event occurred
+               socket->poll.revents = mask; // save event mask as revents
+               numSocksWithREvents++;
+            }
+
+            //cond_resched(); // (commented out for latency reasons)
+         }
+      } // end of for_each_socket loop
+
+      stdWait = NULL; // don't register standard socks for waiting in following loops
+
+      // skip the waiting if we already found something
+      if (numSocksWithREvents || !__timeout || fatal_signal_pending(current))
+         break;
+
+      // skip the waiting if we have an error
+      if(unlikely(stdTable.error) )
+      {
+         table_err = stdTable.error;
+         break;
+      }
+
+      // wait (and reduce remaining timeout)
+      __timeout = schedule_timeout(__timeout);
+
+   } // end of sleep loop
+
+   __set_current_state(TASK_RUNNING);
+
+   // cleanup loop for RDMA socks
+   list_for_each_entry(socket, &state->list, poll._list)
+   {
+      if(socket->sockType == NICADDRTYPE_RDMA)
+      {
+         struct RDMASocket* currentRDMASock = (RDMASocket*)socket;
+         RDMASocket_poll(currentRDMASock, socket->poll._events, true);
+      }
+   }
+
+   // cleanup for standard socks
+   poll_freewait(&stdTable);
+
+   //printk_fhgfs(KERN_INFO, "%s:%d: return %d\n", __func__, __LINE__,
+   //   table_err ? table_err : numSocksWithREvents); // debug in
+
+   return table_err ? table_err : numSocksWithREvents;
+}
+
+
+/**
+ * Note: Old kernel versions do not support validation of the IP string.
+ *
+ * @param outIPAddr set to INADDR_NONE if an error was detected
+ * @return false for wrong input on modern kernels (>= 2.6.20), old kernels always return
+ * true
+ */
+bool SocketTk_getHostByAddrStr(const char* hostAddr, struct in6_addr *ipAddr)
+{
+   struct in_addr in_addr;
+   struct in6_addr in6_addr;
+   const char *end = NULL;
+   if (in4_pton(hostAddr, -1, (void *)&in_addr.s_addr, 0, &end))
+   {
+      // could check if all was consumed using (*end == '\0')
+      *ipAddr = beegfs_mapped_ipv4(in_addr);
+      return true;
+   }
+   else if (in6_pton(hostAddr, -1, (void *)&in6_addr.s6_addr, 0, &end))
+   {
+      // could check if all was consumed using (*end == '\0')
+      *ipAddr = in6_addr;
+      return true;
+   }
+   *ipAddr = beegfs_mapped_ipv4((struct in_addr) { htonl(INADDR_NONE)});
+   return false;
+}
+
+/**
+ * Note: Better use SocketTk_getHostByAddrStr(), which can also check for errors on recent kernels.
+ *
+ * @return INADDR_NONE if an error was detected (recent kernels only)
+ */
+struct in6_addr SocketTk_in_aton(const char* hostAddr)
+{
+   struct in6_addr retVal;
+   SocketTk_getHostByAddrStr(hostAddr, &retVal);
+   return retVal;
+}
+
+
+int SocketTk_ipaddrToStr(char *buf, size_t size, struct in6_addr ipaddress)
+{
+   if (ipv6_addr_v4mapped(&ipaddress))
+   {
+      return scnprintf(buf, size, "%pI4c", &ipaddress.s6_addr[12]); // IPv4 (4 bytes, at offset 12)
+   }
+   else  // IPv6
+   {
+      return scnprintf(buf, size, "%pI6c", &ipaddress.s6_addr[0]); // IPv6 (all 16 bytes)
+   }
+}
+
+int SocketTk_endpointToStr(char *buf, size_t size, struct in6_addr ipaddress, unsigned short port)
+{
+   if (ipv6_addr_v4mapped(&ipaddress))
+   {
+      return scnprintf(buf, size, "%pI4c:%u", &ipaddress.s6_addr[12], (unsigned) port);
+   }
+   else  // IPv6
+   {
+      struct sockaddr_in6 sa = beegfs_make_sockaddr_in6(ipaddress, port);
+      return scnprintf(buf, size, "%pISpc", &sa);
+   }
+}
